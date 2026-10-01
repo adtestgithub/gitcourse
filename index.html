@@ -33,6 +33,7 @@
       --accent: #4cc392; --accent-ink: #0d1f17; --warn-bg: #3a2f14; --warn-ink: #f3cf7a; --danger: #f1867a;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       margin: 0;
       padding-block: 24px;
@@ -110,7 +111,10 @@
         </label>
       </div>
       <img id="preview" class="preview" alt="Receipt photo" hidden>
-      <p id="scan-status" class="status" role="status" hidden></p>
+      <div class="row">
+        <p id="scan-status" class="status" role="status" hidden></p>
+        <button type="button" id="scan-stop" hidden>Stop</button>
+      </div>
     </section>
 
     <section id="review" class="card" aria-labelledby="review-h" hidden>
@@ -258,12 +262,21 @@
       'If the image is not a receipt or no items are readable, reply with []. ' +
       'Example: [{"name": "Whole Milk 1 gal", "qty": 2, "price": 3.49}]';
 
-    async function extractWithClaude(file) {
-      const sample = window.claude?.use ? await window.claude.use('sample') : null;
+    const IN_CLAUDE = !!window.claude?.use;
+    async function extractWithClaude(file, signal) {
+      const sample = IN_CLAUDE ? await window.claude.use('sample') : null;
       if (!sample) return null;
       const limits = await sample.limits().catch(() => null);
       if (!limits?.images) return null;
-      const result = await sample.json(PROMPT, { images: file });
+      const result = await sample.json(PROMPT, {
+        images: file,
+        modelTier: 'quick',
+        signal,
+        onText: ({ text }) => {
+          const n = (text.match(/"name"/g) || []).length;
+          setProgress(n ? `Reading items… ${n} found so far` : 'Reading items…');
+        },
+      });
       if (!Array.isArray(result)) throw { code: 'invalid_json' };
       return result;
     }
@@ -298,7 +311,7 @@
     async function extractWithOcr(file) {
       const T = await loadTesseract();
       const { data } = await T.recognize(file, 'eng', {
-        logger: (m) => { if (m.status === 'recognizing text') setStatus(`Reading receipt… ${Math.round(m.progress * 100)}%`); },
+        logger: (m) => { if (m.status === 'recognizing text') setProgress(`Reading receipt… ${Math.round(m.progress * 100)}%`); },
       });
       return parseReceiptText(data.text || '');
     }
@@ -311,18 +324,59 @@
       session_expired: 'Your Claude session expired. Sign in again and retry.',
     };
 
+    // Progress line with elapsed seconds, so a slow scan never looks frozen
+    let scanCtl = null, scanTimer = null, scanStart = 0, progressText = '';
+    function setProgress(text) {
+      progressText = text;
+      setStatus(`${progressText} (${Math.round((Date.now() - scanStart) / 1000)}s)`);
+    }
+    function startScan() {
+      scanCtl?.abort();
+      scanCtl = new AbortController();
+      scanStart = Date.now();
+      clearInterval(scanTimer);
+      scanTimer = setInterval(() => setProgress(progressText), 1000);
+      setProgress(IN_CLAUDE ? 'Sending photo to Claude… (you may be asked to allow it)' : 'Loading text reader…');
+      $('scan-stop').hidden = false;
+      return scanCtl;
+    }
+    function endScan(ctl) {
+      if (ctl !== scanCtl) return false;   // a newer scan or Stop replaced this one
+      clearInterval(scanTimer);
+      $('scan-stop').hidden = true;
+      scanCtl = null;
+      return true;
+    }
+    $('scan-stop').onclick = () => {
+      const ctl = scanCtl;
+      ctl?.abort(); endScan(ctl);
+      setStatus('Scan stopped.');
+    };
+    const SCAN_TIMEOUT_MS = 120000;
+    function withTimeout(promise, signal) {
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('Reading the receipt took too long. Try a closer, well-lit photo of just the item lines.')), SCAN_TIMEOUT_MS);
+        signal.addEventListener('abort', () => { clearTimeout(t); reject({ code: 'cancelled' }); });
+        promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+      });
+    }
+
     async function handleFile(file) {
       if (!file) return;
       const prev = $('preview');
       if (prev.src) URL.revokeObjectURL(prev.src);
       prev.src = URL.createObjectURL(file); prev.hidden = false;
       $('review').hidden = true;
-      setStatus('Reading receipt…');
+      const ctl = startScan();
       try {
-        let found = null;
-        try { found = await extractWithClaude(file); }
-        catch (e) { if (e?.code !== 'not_granted' && e?.code !== 'images_unavailable') throw e; }
-        if (!found) found = await extractWithOcr(file);
+        let found = await withTimeout(extractWithClaude(file, ctl.signal), ctl.signal);
+        if (!found) {
+          // Inside Claude the page cannot download the OCR engine, so don't try
+          if (IN_CLAUDE) throw new Error('Reading photos is not available in this view. Open the page in the Claude app or claude.ai while signed in.');
+          setProgress('Loading text reader…');
+          found = await withTimeout(extractWithOcr(file), ctl.signal);
+        }
+        if (!endScan(ctl)) return;
         const cleaned = found
           .map((it) => ({
             name: String(it?.name ?? '').trim(),
@@ -334,6 +388,7 @@
         setStatus(`Found ${cleaned.length} item${cleaned.length === 1 ? '' : 's'}. Review them below.`);
         openReview(cleaned);
       } catch (e) {
+        if (!endScan(ctl) || e?.code === 'cancelled') return;
         setStatus(ERRORS[e?.code] || e?.message || 'Something went wrong reading the receipt. Try again.', true);
       }
     }
